@@ -12,7 +12,7 @@ class Server:
         self.host = '0.0.0.0'
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.clients = []
+        self.clients = {}  # Map socket to username
         self.running = False
 
     def start(self):
@@ -25,18 +25,24 @@ class Server:
         while self.running:
             try:
                 client_sock, addr = self.server_socket.accept()
-                self.clients.append(client_sock)
+                self.clients[client_sock] = None
                 threading.Thread(target=self.handle_client, args=(client_sock,), daemon=True).start()
             except Exception:
                 break
 
-    def broadcast_raw(self, sender_sock, data):
-        for client in self.clients:
-            if client != sender_sock:
-                try:
-                    client.sendall(data)
-                except Exception:
-                    pass
+    def _send_to_sockets(self, sockets, data):
+        for client in sockets:
+            try:
+                client.sendall(data)
+            except Exception:
+                pass
+
+    def broadcast_user_list(self):
+        users = [u for u in self.clients.values() if u is not None]
+        msg = {'type': 'USER_LIST', 'users': users}
+        payload = json.dumps(msg).encode('utf-8')
+        header = struct.pack('!I', len(payload))
+        self._send_to_sockets(self.clients.keys(), header + payload)
 
     def handle_client(self, client_sock):
         while self.running:
@@ -45,20 +51,35 @@ class Server:
                 if not header_data:
                     break
                 
-                # Broadcast the header to others
-                self.broadcast_raw(client_sock, header_data)
-                
                 msg_len = struct.unpack('!I', header_data)[0]
                 payload = recvall(client_sock, msg_len)
                 if not payload:
                     break
                 
-                # Broadcast the payload to others
-                self.broadcast_raw(client_sock, payload)
-                
                 msg = json.loads(payload.decode('utf-8'))
+                msg_type = msg.get('type')
                 
-                if msg.get('type') == 'FILE_START':
+                if msg_type == 'JOIN':
+                    self.clients[client_sock] = msg.get('username')
+                    # Broadcast JOIN to others
+                    self._send_to_sockets(
+                        [s for s in self.clients if s != client_sock], 
+                        header_data + payload
+                    )
+                    self.broadcast_user_list()
+                    continue
+                
+                recipient = msg.get('recipient', 'All')
+                target_sockets = []
+                if recipient == 'All':
+                    target_sockets = [s for s in self.clients if s != client_sock]
+                else:
+                    target_sockets = [s for s, u in self.clients.items() if u == recipient and s != client_sock]
+                
+                # Forward the message header and payload
+                self._send_to_sockets(target_sockets, header_data + payload)
+                
+                if msg_type == 'FILE_START':
                     filesize = msg.get('filesize', 0)
                     received = 0
                     while received < filesize:
@@ -66,13 +87,14 @@ class Server:
                         chunk = client_sock.recv(chunk_size)
                         if not chunk:
                             break
-                        self.broadcast_raw(client_sock, chunk)
+                        self._send_to_sockets(target_sockets, chunk)
                         received += len(chunk)
             except Exception:
                 break
         
         if client_sock in self.clients:
-            self.clients.remove(client_sock)
+            del self.clients[client_sock]
+            self.broadcast_user_list()
         try:
             client_sock.close()
         except:
@@ -84,14 +106,14 @@ class Server:
             self.server_socket.close()
         except:
             pass
-        for client in self.clients:
+        for client in self.clients.keys():
             try:
                 client.close()
             except:
                 pass
 
 class Client:
-    def __init__(self, callback_msg, callback_file_progress, callback_file_done, callback_error):
+    def __init__(self, callback_msg, callback_file_progress, callback_file_done, callback_error, callback_user_list=None):
         self.sock = None
         self.running = False
         self.username = ""
@@ -99,6 +121,7 @@ class Client:
         self.callback_file_progress = callback_file_progress
         self.callback_file_done = callback_file_done
         self.callback_error = callback_error
+        self.callback_user_list = callback_user_list
         self.download_dir = os.path.join(os.path.expanduser("~"), "Downloads", "LANChat")
         os.makedirs(self.download_dir, exist_ok=True)
 
@@ -115,20 +138,20 @@ class Client:
             self.callback_error(f"Connection failed: {e}")
             return False
 
-    def send_message(self, text):
+    def send_message(self, text, recipient='All'):
         if self.running and self.sock:
             try:
-                send_json(self.sock, {'type': 'MSG', 'username': self.username, 'text': text})
+                send_json(self.sock, {'type': 'MSG', 'username': self.username, 'text': text, 'recipient': recipient})
             except Exception as e:
                 self.callback_error(f"Send failed: {e}")
 
-    def send_file(self, filepath):
+    def send_file(self, filepath, recipient='All'):
         if self.running and self.sock:
             def _send():
                 try:
                     filename = os.path.basename(filepath)
                     filesize = os.path.getsize(filepath)
-                    send_json(self.sock, {'type': 'FILE_START', 'username': self.username, 'filename': filename, 'filesize': filesize})
+                    send_json(self.sock, {'type': 'FILE_START', 'username': self.username, 'filename': filename, 'filesize': filesize, 'recipient': recipient})
                     
                     with open(filepath, 'rb') as f:
                         while True:
@@ -151,9 +174,12 @@ class Client:
                 sender = msg.get('username', 'Unknown')
                 
                 if msg_type == 'MSG':
-                    self.callback_msg(sender, msg.get('text', ''))
+                    self.callback_msg(sender, msg.get('text', ''), msg.get('recipient', 'All'))
                 elif msg_type == 'JOIN':
                     self.callback_msg("SYSTEM", f"{sender} joined the chat.")
+                elif msg_type == 'USER_LIST':
+                    if self.callback_user_list:
+                        self.callback_user_list(msg.get('users', []))
                 elif msg_type == 'FILE_START':
                     filename = msg.get('filename')
                     filesize = msg.get('filesize')

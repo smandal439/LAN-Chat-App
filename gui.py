@@ -8,7 +8,7 @@ class ChatApplication:
     def __init__(self, root):
         self.root = root
         self.root.title("LAN Chat App")
-        self.root.geometry("600x500")
+        self.root.geometry("800x500")
         
         self.server = None
         self.client = None
@@ -89,7 +89,8 @@ class ChatApplication:
             callback_msg=self.on_message_received,
             callback_file_progress=self.on_file_progress,
             callback_file_done=self.on_file_done,
-            callback_error=self.on_error
+            callback_error=self.on_error,
+            callback_user_list=self.on_user_list_received
         )
         if self.client.connect(ip, port, username):
             self.setup_chat_ui()
@@ -98,10 +99,19 @@ class ChatApplication:
         for widget in self.root.winfo_children():
             widget.destroy()
             
-        self.chat_frame = ttk.Frame(self.root, padding="10")
-        self.chat_frame.pack(expand=True, fill=tk.BOTH)
+        # Main layout
+        self.main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.main_paned.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
         
-        # Header
+        # Left Panel (Chat)
+        self.chat_frame = ttk.Frame(self.main_paned)
+        self.main_paned.add(self.chat_frame, weight=3)
+        
+        # Right Panel (Users)
+        self.users_frame = ttk.Frame(self.main_paned)
+        self.main_paned.add(self.users_frame, weight=1)
+
+        # Header in Chat Frame
         header_text = f"Logged in as {self.client.username}"
         if self.server:
             import socket
@@ -109,16 +119,20 @@ class ChatApplication:
             local_ip = socket.gethostbyname(hostname)
             header_text += f" | Hosting on {local_ip}:{self.server.port}"
         
-        ttk.Label(self.chat_frame, text=header_text, font=("Helvetica", 10, "italic")).pack(anchor=tk.W, pady=(0, 10))
+        header_frame = ttk.Frame(self.chat_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        ttk.Label(header_frame, text=header_text, font=("Helvetica", 10, "italic")).pack(side=tk.LEFT)
+        ttk.Button(header_frame, text="Clear Chat", command=self.clear_chat).pack(side=tk.RIGHT)
         
         # Chat area
         self.chat_area = scrolledtext.ScrolledText(self.chat_frame, wrap=tk.WORD, state=tk.DISABLED, font=("Helvetica", 10))
         self.chat_area.pack(expand=True, fill=tk.BOTH, pady=(0, 10))
         
-        # Configure tags for chat formatting
         self.chat_area.tag_configure("SYSTEM", foreground="red")
         self.chat_area.tag_configure("ME", foreground="blue")
         self.chat_area.tag_configure("OTHER", foreground="black")
+        self.chat_area.tag_configure("DM", foreground="purple")
         
         # Input area
         input_frame = ttk.Frame(self.chat_frame)
@@ -134,36 +148,85 @@ class ChatApplication:
         # Footer
         footer_text = f"Files download to: {self.client.download_dir}"
         ttk.Label(self.chat_frame, text=footer_text, font=("Helvetica", 8)).pack(anchor=tk.W, pady=(5, 0))
+
+        # Right Panel Components
+        ttk.Label(self.users_frame, text="Online Users", font=("Helvetica", 12, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        
+        self.users_listbox = tk.Listbox(self.users_frame, font=("Helvetica", 10), selectmode=tk.SINGLE)
+        self.users_listbox.pack(expand=True, fill=tk.BOTH)
+        
+        send_to_frame = ttk.Frame(self.users_frame)
+        send_to_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Label(send_to_frame, text="Send To:").pack(side=tk.LEFT)
+        self.recipient_var = tk.StringVar(value="All")
+        self.recipient_combo = ttk.Combobox(send_to_frame, textvariable=self.recipient_var, state="readonly")
+        self.recipient_combo['values'] = ("All",)
+        self.recipient_combo.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(5, 0))
         
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    def write_chat(self, sender, text, tag="OTHER"):
+    def clear_chat(self):
         self.chat_area.config(state=tk.NORMAL)
+        self.chat_area.delete(1.0, tk.END)
+        self.chat_area.config(state=tk.DISABLED)
+
+    def write_chat(self, sender, text, recipient="All"):
+        self.chat_area.config(state=tk.NORMAL)
+        tag = "OTHER"
         if sender == "SYSTEM":
-            self.chat_area.insert(tk.END, f"[{sender}] {text}\n", "SYSTEM")
+            tag = "SYSTEM"
         elif sender == self.client.username:
-            self.chat_area.insert(tk.END, f"[{sender}] {text}\n", "ME")
+            tag = "ME"
+            if recipient != "All":
+                text = f"(DM to {recipient}) {text}"
+                tag = "DM"
         else:
-            self.chat_area.insert(tk.END, f"[{sender}] {text}\n", tag)
+            if recipient != "All":
+                text = f"(DM from {sender}) {text}"
+                tag = "DM"
+
+        self.chat_area.insert(tk.END, f"[{sender}] {text}\n", tag)
         self.chat_area.see(tk.END)
         self.chat_area.config(state=tk.DISABLED)
 
     def send_message(self):
         text = self.msg_entry.get().strip()
+        recipient = self.recipient_var.get()
         if text:
-            self.client.send_message(text)
-            self.write_chat(self.client.username, text)
+            self.client.send_message(text, recipient)
+            self.write_chat(self.client.username, text, recipient)
             self.msg_entry.delete(0, tk.END)
 
     def send_file(self):
         filepath = filedialog.askopenfilename(title="Select a file to send")
+        recipient = self.recipient_var.get()
         if filepath:
-            self.client.send_file(filepath)
-            self.write_chat("SYSTEM", f"Started sending file: {os.path.basename(filepath)}")
+            self.client.send_file(filepath, recipient)
+            target = f"to {recipient}" if recipient != 'All' else "to All"
+            self.write_chat("SYSTEM", f"Started sending file: {os.path.basename(filepath)} {target}")
 
     # Callbacks from Client thread must be routed to main thread safely via root.after
-    def on_message_received(self, sender, text):
-        self.root.after(0, self.write_chat, sender, text)
+    def on_message_received(self, sender, text, recipient="All"):
+        self.root.after(0, self.write_chat, sender, text, recipient)
+
+    def on_user_list_received(self, users):
+        self.root.after(0, self.update_user_list, users)
+
+    def update_user_list(self, users):
+        self.users_listbox.delete(0, tk.END)
+        combo_values = ["All"]
+        for u in users:
+            display = u
+            if u == self.client.username:
+                display += " (You)"
+            self.users_listbox.insert(tk.END, display)
+            if u != self.client.username:
+                combo_values.append(u)
+        
+        self.recipient_combo['values'] = tuple(combo_values)
+        if self.recipient_var.get() not in combo_values:
+            self.recipient_var.set("All")
 
     def on_file_progress(self, sender, filename, received, total):
         pass # Optional: Could implement a progress bar here
