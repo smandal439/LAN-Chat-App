@@ -1,1 +1,4 @@
 pyinstaller
+aiortc>=1.15.0
+opencv-python>=4.10.0.84,<5
+sounddevice>=0.5.2

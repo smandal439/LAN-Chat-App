@@ -1,8 +1,10 @@
 import os
 import socket
+import base64
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+from media import CallManager
 from network import Client, Server
 
 
@@ -15,6 +17,9 @@ class ChatApplication:
 
         self.server = None
         self.client = None
+        self.call_manager = None
+        self.video_window = None
+        self.video_image = None
         self.setup_login_ui()
 
     def _get_port_value(self):
@@ -98,6 +103,7 @@ class ChatApplication:
             callback_file_done=self.on_file_done,
             callback_error=self.on_error,
             callback_user_list=self.on_user_list_received,
+            callback_call_signal=self.on_call_signal,
         )
         if self.client.connect(ip, port, username):
             self.setup_chat_ui()
@@ -144,6 +150,14 @@ class ChatApplication:
         ttk.Button(input_frame, text='Send', command=self.send_message).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(input_frame, text='Send File', command=self.send_file).pack(side=tk.LEFT)
 
+        call_frame = ttk.Frame(self.chat_frame)
+        call_frame.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(call_frame, text='Voice Call', command=lambda: self.start_call(False)).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(call_frame, text='Video Call', command=lambda: self.start_call(True)).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(call_frame, text='End Call', command=self.end_call).pack(side=tk.LEFT)
+        self.call_status_var = tk.StringVar(value='Not in a call')
+        ttk.Label(call_frame, textvariable=self.call_status_var).pack(side=tk.LEFT, padx=10)
+
         footer_text = f'Files download to: {self.client.download_dir}'
         ttk.Label(self.chat_frame, text=footer_text, font=('Helvetica', 8)).pack(anchor=tk.W, pady=(5, 0))
 
@@ -161,7 +175,77 @@ class ChatApplication:
         self.recipient_combo['values'] = ('All',)
         self.recipient_combo.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(5, 0))
 
+        self.call_manager = CallManager(
+            send_signal=self.client.send_call_signal,
+            on_status=self.on_call_status,
+            on_video_frame=self.on_video_frame,
+        )
         self.root.protocol('WM_DELETE_WINDOW', self.on_closing)
+
+    def start_call(self, video):
+        if not self.client or not self.call_manager:
+            return
+        recipient = self.recipient_var.get()
+        if recipient == 'All':
+            messagebox.showerror('Call', 'Select an online user from Send To before starting a call.')
+            return
+        self.call_manager.start_call(recipient, video)
+
+    def end_call(self):
+        if self.call_manager:
+            self.call_manager.end_call()
+
+    def on_call_signal(self, message):
+        self.root.after(0, self.handle_call_signal, message)
+
+    def handle_call_signal(self, message):
+        if not self.call_manager:
+            return
+        if message.get('action') == 'offer':
+            if not self.call_manager.handle_signal(message):
+                return
+            mode = 'video' if message.get('video') is True else 'voice'
+            if messagebox.askyesno('Incoming call', f"{message.get('username', 'Someone')} is calling ({mode}). Accept?"):
+                self.call_manager.accept(message)
+            else:
+                self.call_manager.reject()
+            return
+        self.call_manager.handle_signal(message)
+
+    def on_call_status(self, status, peer):
+        self.root.after(0, self.update_call_status, status, peer)
+
+    def update_call_status(self, status, peer):
+        if not hasattr(self, 'call_status_var'):
+            return
+        self.call_status_var.set('Incoming call...' if status.startswith('incoming:') else status)
+        if (
+            status == 'Call ended.'
+            or status == 'No answer. Call ended.'
+            or status.startswith('Call setup failed:')
+            or status.endswith('the call.')
+        ) and self.video_window is not None:
+            self.video_window.destroy()
+            self.video_window = None
+            self.video_image = None
+
+    def on_video_frame(self, frame):
+        self.root.after(0, self.render_video_frame, frame)
+
+    def render_video_frame(self, frame):
+        if not self.call_manager or self.call_manager.call_id is None:
+            return
+        if self.video_window is None or not self.video_window.winfo_exists():
+            self.video_window = tk.Toplevel(self.root)
+            self.video_window.title('Incoming video')
+            self.video_window.protocol('WM_DELETE_WINDOW', self.end_call)
+            self.video_label = ttk.Label(self.video_window)
+            self.video_label.pack()
+        height, width, _ = frame.shape
+        ppm = f'P6 {width} {height} 255\n'.encode('ascii') + frame.tobytes()
+        encoded = base64.b64encode(ppm).decode('ascii')
+        self.video_image = tk.PhotoImage(data=encoded, format='PPM')
+        self.video_label.configure(image=self.video_image)
 
     def clear_chat(self):
         if hasattr(self, 'chat_area'):
@@ -244,10 +328,18 @@ class ChatApplication:
         pass
 
     def on_error(self, message):
-        self.root.after(0, messagebox.showerror, 'Network Error', message)
-        self.root.after(0, self.setup_login_ui)
+        self.root.after(0, self.handle_network_error, message)
+
+    def handle_network_error(self, message):
+        if self.call_manager:
+            self.call_manager.close(notify_peer=False)
+            self.call_manager = None
+        messagebox.showerror('Network Error', message)
+        self.setup_login_ui()
 
     def on_closing(self):
+        if self.call_manager:
+            self.call_manager.close()
         if self.client:
             self.client.disconnect()
         if self.server:
@@ -263,4 +355,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

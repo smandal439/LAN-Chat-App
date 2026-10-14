@@ -4,6 +4,7 @@ import socket
 import struct
 import threading
 import time
+from contextlib import ExitStack
 
 from protocol import recv_json, recvall, send_json
 
@@ -14,6 +15,7 @@ class Server:
         self.host = '0.0.0.0'
         self.server_socket = None
         self.clients = {}  # Map socket to username
+        self.client_send_locks = {}
         self.running = False
 
     def start(self):
@@ -40,6 +42,7 @@ class Server:
                 self.server_socket.settimeout(0.5)
                 client_sock, _ = self.server_socket.accept()
                 self.clients[client_sock] = None
+                self.client_send_locks[client_sock] = threading.Lock()
                 threading.Thread(target=self.handle_client, args=(client_sock,), daemon=True).start()
             except socket.timeout:
                 continue
@@ -60,7 +63,8 @@ class Server:
     def _send_to_sockets(self, sockets, data):
         for client in list(sockets):
             try:
-                client.sendall(data)
+                with self.client_send_locks[client]:
+                    client.sendall(data)
             except (OSError, ConnectionError, ValueError):
                 self._remove_client(client)
 
@@ -112,6 +116,25 @@ class Server:
                 if not isinstance(recipient, str):
                     recipient = 'All'
 
+                if msg_type == 'CALL_SIGNAL':
+                    sender = self.clients.get(client_sock)
+                    call_id = msg.get('call_id')
+                    action = msg.get('action')
+                    if (
+                        not sender
+                        or recipient == 'All'
+                        or not isinstance(call_id, str)
+                        or len(call_id) != 32
+                        or not isinstance(action, str)
+                        or action not in ('offer', 'answer', 'reject', 'hangup')
+                    ):
+                        continue
+                    if action in ('offer', 'answer') and not isinstance(msg.get('sdp'), dict):
+                        continue
+                    msg['username'] = sender
+                    payload = json.dumps(msg, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+                    header_data = struct.pack('!I', len(payload))
+
                 target_sockets = []
                 if recipient == 'All':
                     target_sockets = [sock for sock in self.clients if sock != client_sock]
@@ -121,20 +144,44 @@ class Server:
                         if sock != client_sock and username == recipient
                     ]
 
-                self._send_to_sockets(target_sockets, header_data + payload)
-
                 if msg_type == 'FILE_START':
                     filesize = msg.get('filesize', 0)
                     if not isinstance(filesize, int) or filesize < 0:
                         break
                     received = 0
-                    while received < filesize:
-                        chunk_size = min(4096, filesize - received)
-                        chunk = recvall(client_sock, chunk_size)
-                        if not chunk:
-                            break
-                        self._send_to_sockets(target_sockets, chunk)
-                        received += len(chunk)
+                    failed_targets = []
+                    incomplete = False
+                    with ExitStack() as send_locks:
+                        for target in sorted(target_sockets, key=id):
+                            send_locks.enter_context(self.client_send_locks[target])
+                        for target in target_sockets:
+                            try:
+                                target.sendall(header_data + payload)
+                            except (OSError, ConnectionError, ValueError):
+                                failed_targets.append(target)
+
+                        while received < filesize:
+                            chunk_size = min(4096, filesize - received)
+                            chunk = recvall(client_sock, chunk_size)
+                            if not chunk:
+                                incomplete = True
+                                break
+                            received += len(chunk)
+                            for target in target_sockets:
+                                if target in failed_targets:
+                                    continue
+                                try:
+                                    target.sendall(chunk)
+                                except (OSError, ConnectionError, ValueError):
+                                    failed_targets.append(target)
+
+                    for target in failed_targets:
+                        self._remove_client(target)
+                    if incomplete:
+                        break
+                    continue
+
+                self._send_to_sockets(target_sockets, header_data + payload)
             except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, struct.error):
                 break
 
@@ -153,7 +200,15 @@ class Server:
 
 
 class Client:
-    def __init__(self, callback_msg, callback_file_progress, callback_file_done, callback_error, callback_user_list=None):
+    def __init__(
+        self,
+        callback_msg,
+        callback_file_progress,
+        callback_file_done,
+        callback_error,
+        callback_user_list=None,
+        callback_call_signal=None,
+    ):
         self.sock = None
         self.running = False
         self.username = ''
@@ -162,6 +217,8 @@ class Client:
         self.callback_file_done = callback_file_done
         self.callback_error = callback_error
         self.callback_user_list = callback_user_list
+        self.callback_call_signal = callback_call_signal
+        self.send_lock = threading.Lock()
         self.download_dir = os.path.join(os.path.expanduser('~'), 'Downloads', 'LANChat')
         os.makedirs(self.download_dir, exist_ok=True)
 
@@ -205,10 +262,32 @@ class Client:
             recipient = 'All'
 
         try:
-            send_json(self.sock, {'type': 'MSG', 'username': self.username, 'text': text, 'recipient': recipient})
+            with self.send_lock:
+                send_json(self.sock, {'type': 'MSG', 'username': self.username, 'text': text, 'recipient': recipient})
         except Exception as exc:
             if callable(self.callback_error):
                 self.callback_error(f'Send failed: {exc}')
+
+    def send_call_signal(self, recipient, call_id, action, sdp=None, video=None):
+        if not self.running or self.sock is None:
+            return
+        message = {
+            'type': 'CALL_SIGNAL',
+            'username': self.username,
+            'recipient': recipient,
+            'call_id': call_id,
+            'action': action,
+        }
+        if sdp is not None:
+            message['sdp'] = sdp
+        if video is not None:
+            message['video'] = bool(video)
+        try:
+            with self.send_lock:
+                send_json(self.sock, message)
+        except (OSError, ValueError) as exc:
+            if callable(self.callback_error):
+                self.callback_error(f'Call signaling failed: {exc}')
 
     def send_file(self, filepath, recipient='All'):
         if not self.running or self.sock is None:
@@ -223,14 +302,14 @@ class Client:
             try:
                 filename = os.path.basename(filepath)
                 filesize = os.path.getsize(filepath)
-                send_json(self.sock, {'type': 'FILE_START', 'username': self.username, 'filename': filename, 'filesize': filesize, 'recipient': recipient})
-
-                with open(filepath, 'rb') as f:
-                    while True:
-                        chunk = f.read(4096)
-                        if not chunk:
-                            break
-                        self.sock.sendall(chunk)
+                with self.send_lock:
+                    send_json(self.sock, {'type': 'FILE_START', 'username': self.username, 'filename': filename, 'filesize': filesize, 'recipient': recipient})
+                    with open(filepath, 'rb') as f:
+                        while True:
+                            chunk = f.read(4096)
+                            if not chunk:
+                                break
+                            self.sock.sendall(chunk)
             except Exception as exc:
                 if callable(self.callback_error):
                     self.callback_error(f'File send failed: {exc}')
@@ -264,6 +343,9 @@ class Client:
                     users = msg.get('users', [])
                     if callable(self.callback_user_list):
                         self.callback_user_list(users)
+                elif msg_type == 'CALL_SIGNAL':
+                    if callable(self.callback_call_signal):
+                        self.callback_call_signal(msg)
                 elif msg_type == 'FILE_START':
                     filename = msg.get('filename', 'received_file.bin')
                     filesize = msg.get('filesize')
